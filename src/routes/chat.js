@@ -4,7 +4,6 @@ import Anthropic from '@anthropic-ai/sdk';
 const router = Router();
 const getClient = () => new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-
 /**
  * POST /api/chat
  * Body: { messages: [{ role: 'user' | 'assistant', content: string }] }
@@ -18,10 +17,10 @@ router.post('/', async (req, res) => {
 
   try {
     const response = await getClient().messages.create({
-	model: 'claude-sonnet-4-6',
-      	max_tokens: 8096,
-      	system: system || 'You are a helpful assistant.',
-      	messages,
+      model: 'claude-sonnet-4-6',
+      max_tokens: 8096,
+      system: system || 'You are a helpful assistant.',
+      messages,
     });
 
     const assistantMessage = response.content[0]?.text ?? '';
@@ -50,11 +49,18 @@ router.post('/stream', async (req, res) => {
     return res.status(400).json({ error: 'messages array is required' });
   }
 
-  // Set SSE headers
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
+
+  const write = (payload) => {
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    if (typeof res.flush === 'function') res.flush();
+  };
+
+  let finished = false;
 
   try {
     const stream = getClient().messages.stream({
@@ -64,23 +70,29 @@ router.post('/stream', async (req, res) => {
       messages,
     });
 
-    stream.on('text', (text) => {
-      res.write(`data: ${JSON.stringify({ type: 'text', text })}\n\n`);
+    // Use res.on (not req.on) — fires only on actual client disconnect
+    res.on('close', () => {
+      if (!finished) stream.controller.abort();
     });
 
-    stream.on('message', (message) => {
-      res.write(`data: ${JSON.stringify({ type: 'done', usage: message.usage })}\n\n`);
-      res.end();
-    });
+    for await (const chunk of stream) {
+      if (
+        chunk.type === 'content_block_delta' &&
+        chunk.delta.type === 'text_delta'
+      ) {
+        write({ type: 'text', text: chunk.delta.text });
+      }
+    }
 
-    stream.on('error', (err) => {
-      res.write(`data: ${JSON.stringify({ type: 'error', error: err.message })}\n\n`);
-      res.end();
-    });
+    finished = true;
+    write({ type: 'done' });
+    res.end();
 
-    req.on('close', () => stream.controller.abort());
   } catch (err) {
-    res.write(`data: ${JSON.stringify({ type: 'error', error: err.message })}\n\n`);
+    if (err.name !== 'APIUserAbortError') {
+      console.error('Stream error:', err.message);
+      write({ type: 'error', error: err.message });
+    }
     res.end();
   }
 });
